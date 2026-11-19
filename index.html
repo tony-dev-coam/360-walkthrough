@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>360 Walkthrough Demo</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#111;font:14px/1.4 system-ui,sans-serif;color:#fff}
+  canvas{display:block;touch-action:none;cursor:grab}
+  canvas:active{cursor:grabbing}
+  .hot{position:absolute;transform:translate(-50%,-50%);width:56px;height:56px;border-radius:50%;
+    border:2px solid #fff;background:rgba(255,255,255,.18);backdrop-filter:blur(4px);cursor:pointer;
+    display:grid;place-items:center;transition:transform .15s}
+  .hot:hover{transform:translate(-50%,-50%) scale(1.12)}
+  .hot::after{content:"";width:14px;height:14px;border-top:3px solid #fff;border-right:3px solid #fff;transform:rotate(-45deg) translate(-2px,2px)}
+  .hot span{position:absolute;top:62px;white-space:nowrap;font-size:12px;background:rgba(0,0,0,.55);padding:2px 8px;border-radius:10px}
+  #ui{position:fixed;left:16px;bottom:16px;display:flex;gap:8px;flex-wrap:wrap}
+  #ui button{font:inherit;color:#fff;background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.35);border-radius:20px;padding:8px 14px;cursor:pointer}
+  #ui button.on{background:#fff;color:#111}
+  #title{position:fixed;left:16px;top:16px;background:rgba(0,0,0,.55);padding:8px 14px;border-radius:20px}
+  #credit{position:fixed;right:16px;bottom:16px;font-size:11px;opacity:.7}
+  #credit a{color:#fff}
+  #load{position:fixed;inset:0;display:grid;place-items:center;background:#111;transition:opacity .5s}
+</style>
+</head>
+<body>
+<div id="title">Room 1</div>
+<div id="ui">
+  <button data-light="day" class="on">Day</button>
+  <button data-light="night">Night</button>
+</div>
+<div id="credit">Panoramas: <a href="https://polyhaven.com" target="_blank" rel="noopener">Poly Haven</a> (CC0)</div>
+<div id="load">Loading 0/4</div>
+
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+<script type="module">
+import * as THREE from 'three';
+
+// Two rooms, each rendered for day + night from the same camera position.
+// door.u/v = where the door sits in the equirect image (0..1), to = room it leads to.
+const ROOMS = [
+  { name: 'Room 1', day: 'pano/room1.jpg', night: 'pano/room3.jpg', door: { u: 0.054, v: 0.47, to: 1 } },
+  { name: 'Room 2', day: 'pano/room4.jpg', night: 'pano/room2.jpg', door: { u: 0.16,  v: 0.47, to: 0 } },
+];
+const R = 10;          // sphere radius
+const STEP = 6;        // how far the camera travels between rooms (must be < R)
+const DUR = 1600;      // transition ms
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 100);
+
+// Equirect lookup in the fragment shader (object space), so a mesh rotation turns the panorama.
+const vert = `varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.); }`;
+const frag = `uniform sampler2D map; uniform float opacity; varying vec3 vDir;
+  void main(){ vec3 d = normalize(vDir);
+    vec2 uv = vec2(atan(d.z, d.x) / 6.2831853 + .5, asin(clamp(d.y,-1.,1.)) / 3.1415927 + .5);
+    gl_FragColor = vec4(texture2D(map, uv).rgb, opacity);
+    #include <colorspace_fragment>
+  }`;
+const geo = new THREE.SphereGeometry(R, 96, 48);
+function pano() {
+  const m = new THREE.Mesh(geo, new THREE.ShaderMaterial({
+    uniforms: { map: { value: null }, opacity: { value: 1 } }, vertexShader: vert, fragmentShader: frag,
+    side: THREE.BackSide, transparent: true, depthTest: false, depthWrite: false }));
+  scene.add(m);
+  return m;
+}
+const cur = pano(), next = pano();
+cur.renderOrder = 0; next.renderOrder = 1; next.visible = false;
+
+// Load all textures up front so transitions never wait on the network.
+const tex = {};
+const loader = new THREE.TextureLoader();
+const loadEl = document.getElementById('load');
+let loaded = 0;
+await Promise.all(ROOMS.flatMap(r => [r.day, r.night]).map(src => loader.loadAsync(src).then(t => {
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.generateMipmaps = false; t.minFilter = THREE.LinearFilter; // ponytail: no mipmaps avoids the atan seam line
+  tex[src] = t; loadEl.textContent = `Loading ${++loaded}/4`;
+})));
+loadEl.style.opacity = 0; setTimeout(() => loadEl.remove(), 500);
+
+let room = 0, light = 'day', busy = false;
+let lon = 0, lat = 0, fov = 75;               // view direction (radians)
+cur.material.uniforms.map.value = tex[ROOMS[0].day];
+
+// theta = angle in the XZ plane, same convention as the shader's atan(z, x).
+const uToTheta = u => (u - 0.5) * Math.PI * 2;
+const vToPhi = v => (v - 0.5) * Math.PI;
+const dirOf = (th, ph) => new THREE.Vector3(Math.cos(ph) * Math.cos(th), Math.sin(ph), Math.cos(ph) * Math.sin(th));
+// Mesh rotation.y = r makes local angle th show up at world angle th - r.
+const doorWorldTheta = () => uToTheta(ROOMS[room].door.u) - cur.rotation.y;
+
+// Hotspot as an HTML element projected each frame.
+const hot = document.createElement('div');
+hot.className = 'hot'; hot.innerHTML = '<span></span>';
+document.body.append(hot);
+hot.onclick = () => walk();
+
+function walk() {
+  if (busy) return;
+  busy = true;
+  const d = ROOMS[room].door, to = ROOMS[d.to];
+  const th = doorWorldTheta();
+  // Enter the next room facing away from its door: its (door + PI) direction lines up with our heading.
+  next.rotation.y = uToTheta(to.door.u) + Math.PI - th;
+  next.position.copy(dirOf(th, 0).multiplyScalar(STEP));
+  next.material.uniforms.map.value = tex[to[light]];
+  next.material.uniforms.opacity.value = 0;
+  next.visible = true;
+  const lon0 = lon, lat0 = lat;
+  const dLon = Math.atan2(Math.sin(th - lon0), Math.cos(th - lon0)); // shortest turn
+  animate(t => {
+    const turn = ease(Math.min(t / 0.35, 1));          // face the door first
+    lon = lon0 + dLon * turn; lat = lat0 * (1 - turn);
+    const move = ease(Math.max((t - 0.15) / 0.85, 0));  // then glide through it
+    camera.position.copy(next.position).multiplyScalar(move);
+    fov = 75 - 18 * Math.sin(move * Math.PI);          // slight zoom while moving
+    next.material.uniforms.opacity.value = ease(Math.min(Math.max((move - 0.2) / 0.6, 0), 1));
+  }, () => {
+    // Swap: the new room becomes current, recentred at the origin.
+    cur.rotation.y = next.rotation.y;
+    cur.material.uniforms.map.value = next.material.uniforms.map.value;
+    next.visible = false; camera.position.set(0, 0, 0);
+    room = d.to; setTitle(); busy = false;
+  });
+}
+
+function setLight(l) {
+  if (busy || l === light) return;
+  busy = true; light = l;
+  document.querySelectorAll('#ui button').forEach(b => b.classList.toggle('on', b.dataset.light === l));
+  next.position.set(0, 0, 0); next.rotation.y = cur.rotation.y;
+  next.material.uniforms.map.value = tex[ROOMS[room][l]];
+  next.material.uniforms.opacity.value = 0; next.visible = true;
+  animate(t => next.material.uniforms.opacity.value = ease(t), () => {
+    cur.material.uniforms.map.value = next.material.uniforms.map.value;
+    next.visible = false; busy = false;
+  }, 900);
+}
+document.querySelectorAll('#ui button').forEach(b => b.onclick = () => setLight(b.dataset.light));
+
+const ease = t => t < .5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
+function animate(step, done, dur = DUR) {
+  const t0 = performance.now();
+  (function tick() {
+    const t = Math.min((performance.now() - t0) / dur, 1);
+    step(t);
+    t < 1 ? requestAnimationFrame(tick) : done();
+  })();
+}
+const setTitle = () => {
+  document.getElementById('title').textContent = ROOMS[room].name;
+  hot.querySelector('span').textContent = 'Go to ' + ROOMS[ROOMS[room].door.to].name;
+};
+setTitle();
+
+// Drag to look (mouse + touch), wheel / pinch-free FOV zoom.
+let drag = null;
+const el = renderer.domElement;
+el.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY, lon, lat }; el.setPointerCapture(e.pointerId); });
+el.addEventListener('pointermove', e => {
+  if (!drag || busy) return;
+  const k = (fov * Math.PI / 180) / innerHeight;
+  lon = drag.lon - (e.clientX - drag.x) * k;
+  lat = Math.max(-1.4, Math.min(1.4, drag.lat + (e.clientY - drag.y) * k));
+});
+el.addEventListener('pointerup', () => drag = null);
+el.addEventListener('wheel', e => { if (!busy) fov = Math.max(35, Math.min(90, fov + e.deltaY * 0.03)); }, { passive: true });
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; });
+
+const v = new THREE.Vector3();
+renderer.setAnimationLoop(() => {
+  camera.fov = fov; camera.updateProjectionMatrix();
+  camera.lookAt(v.copy(camera.position).add(dirOf(lon, lat)));
+  // Place the door hotspot on screen (hidden while walking or when behind the camera).
+  const d = ROOMS[room].door;
+  v.copy(dirOf(doorWorldTheta(), vToPhi(d.v))).multiplyScalar(R * 0.9).project(camera);
+  const show = !busy && v.z < 1 && Math.abs(v.x) < 1.1 && Math.abs(v.y) < 1.1;
+  hot.style.display = show ? '' : 'none';
+  if (show) { hot.style.left = (v.x + 1) / 2 * innerWidth + 'px'; hot.style.top = (1 - v.y) / 2 * innerHeight + 'px'; }
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
